@@ -3,16 +3,18 @@ import { Injectable }             from '@angular/core';
 import { File, FileEntry }        from '@ionic-native/file';
 import { normalizeURL, Platform } from 'ionic-angular';
 import { fromEvent }              from 'rxjs/observable/fromEvent';
-import { first }                  from 'rxjs/operators';
+import { fromPromise }            from 'rxjs/observable/fromPromise';
+import { first, map, switchMap }             from 'rxjs/operators';
 import { ImageLoaderConfig }      from './image-loader-config';
+import { Observable } from 'rxjs/Observable';
 
-interface IndexItem {
+export interface IndexItem {
   name: string;
   modificationTime: Date;
   size: number;
 }
 
-interface QueueItem {
+export interface QueueItem {
   imageUrl: string;
   resolve: Function;
   reject: Function;
@@ -27,37 +29,37 @@ export class ImageLoader {
    * When the cache service isn't ready, images are loaded via browser instead.
    * @type {boolean}
    */
-  private isCacheReady: boolean = false;
+  protected isCacheReady: boolean = false;
   /**
    * Indicates if this service is initialized.
    * This service is initialized once all the setup is done.
    * @type {boolean}
    */
-  private isInit: boolean = false;
+  protected isInit: boolean = false;
   /**
    * Number of concurrent requests allowed
    * @type {number}
    */
-  private concurrency: number = 5;
+  protected concurrency: number = 5;
   /**
    * Queue items
    * @type {Array}
    */
-  private queue: QueueItem[] = [];
-  private processing: number = 0;
+  protected queue: QueueItem[] = [];
+  protected processing: number = 0;
   /**
    * Fast accessible Object for currently processing items
    */
-  private currentlyProcessing: { [index: string]: Promise<any> } = {};
-  private cacheIndex: IndexItem[] = [];
-  private currentCacheSize: number = 0;
-  private indexed: boolean = false;
+  protected currentlyProcessing: { [index: string]: Promise<any> } = {};
+  protected cacheIndex: IndexItem[] = [];
+  protected currentCacheSize: number = 0;
+  protected indexed: boolean = false;
 
   constructor(
-    private config: ImageLoaderConfig,
-    private file: File,
-    private http: HttpClient,
-    private platform: Platform,
+    protected config: ImageLoaderConfig,
+    protected file: File,
+    protected http: HttpClient,
+    protected platform: Platform,
   ) {
     if (!platform.is('cordova')) {
       // we are running on a browser, or using livereload
@@ -88,14 +90,14 @@ export class ImageLoader {
     return File.installed();
   }
 
-  private get isCacheSpaceExceeded(): boolean {
+  protected get isCacheSpaceExceeded(): boolean {
     return (
       this.config.maxCacheSize > -1 &&
       this.currentCacheSize > this.config.maxCacheSize
     );
   }
 
-  private get isWKWebView(): boolean {
+  protected get isWKWebView(): boolean {
     return (
       this.platform.is('ios') &&
       (<any>window).webkit &&
@@ -103,14 +105,14 @@ export class ImageLoader {
     );
   }
 
-  private get isIonicWKWebView(): boolean {
+  protected get isIonicWKWebView(): boolean {
     return (
       (this.isWKWebView || this.platform.is('android')) &&
       (location.host === 'localhost:8080' || (<any>window).LiveReload)
     );
   }
 
-  private get isDevServer(): boolean {
+  protected get isDevServer(): boolean {
     return window['IonicDevServer'] !== undefined;
   }
 
@@ -118,7 +120,7 @@ export class ImageLoader {
    * Check if we can process more items in the queue
    * @returns {boolean}
    */
-  private get canProcess(): boolean {
+  protected get canProcess(): boolean {
     return this.queue.length > 0 && this.processing < this.concurrency;
   }
 
@@ -266,7 +268,7 @@ export class ImageLoader {
    * Returns if an imageUrl is an relative path
    * @param {string} imageUrl
    */
-  private isImageUrlRelative(imageUrl: string) {
+  protected isImageUrlRelative(imageUrl: string) {
     return !/^(https?|file):\/\/\/?/i.test(imageUrl);
   }
 
@@ -276,7 +278,7 @@ export class ImageLoader {
    * @param resolve
    * @param reject
    */
-  private addItemToQueue(imageUrl: string, resolve, reject): void {
+  protected addItemToQueue(imageUrl: string, resolve, reject): void {
     this.queue.push({
       imageUrl,
       resolve,
@@ -289,7 +291,7 @@ export class ImageLoader {
   /**
    * Processes one item from the queue
    */
-  private processQueue() {
+  protected processQueue() {
     // make sure we can process items first
     if (!this.canProcess) {
       return;
@@ -328,27 +330,18 @@ export class ImageLoader {
         const localDir = this.getFileCacheDirectory() + this.config.cacheDirectoryName + '/';
         const fileName = this.createFileName(currentItem.imageUrl);
 
-        this.http.get(currentItem.imageUrl, {
-          responseType: 'blob',
-          headers: this.config.httpHeaders
-        }).subscribe(
-          (data: Blob) => {
-            this.file.writeFile(localDir, fileName, data, {replace: true}).then((file: FileEntry) => {
-              if (this.isCacheSpaceExceeded) {
+        this.loadFileFromUrl(currentItem.imageUrl, localDir, fileName).subscribe(
+          (file: FileEntry) => {
+            if (this.isCacheSpaceExceeded) {
+              this.maintainCacheSize();
+            }
+            this.addFileToIndex(file).then(() => {
+              this.getCachedImagePath(currentItem.imageUrl).then((localUrl) => {
+                currentItem.resolve(localUrl);
+                resolve();
+                done();
                 this.maintainCacheSize();
-              }
-              this.addFileToIndex(file).then(() => {
-                this.getCachedImagePath(currentItem.imageUrl).then((localUrl) => {
-                  currentItem.resolve(localUrl);
-                  resolve();
-                  done();
-                  this.maintainCacheSize();
-                });
               });
-            }).catch((e) => {
-              //Could not write image
-              error(e);
-              reject(e);
             });
           },
           (e) => {
@@ -373,11 +366,22 @@ export class ImageLoader {
   }
 
   /**
+   * load fileEntry from url
+   * @param imageUrl 
+   */
+  protected loadFileFromUrl(url: string, localDir: string, fileName: string): Observable<FileEntry> {
+    return this.http.get(url, {
+      responseType: 'blob',
+      headers: this.config.httpHeaders
+    }).pipe(switchMap((data: Blob) =>  fromPromise(this.file.writeFile(localDir, fileName, data, {replace: true}))));
+  }
+
+  /**
    * Search if the url is currently in the queue
    * @param imageUrl {string} Image url to search
    * @returns {boolean}
    */
-  private currentlyInQueue(imageUrl: string) {
+  protected currentlyInQueue(imageUrl: string) {
     return this.queue.some(item => item.imageUrl === imageUrl);
   }
 
@@ -385,7 +389,7 @@ export class ImageLoader {
    * Initialize the cache service
    * @param [boolean] replace Whether to replace the cache directory if it already exists
    */
-  private initCache(replace?: boolean): void {
+  protected initCache(replace?: boolean): void {
     this.concurrency = this.config.concurrency;
 
     // create cache directories if they do not exist
@@ -407,7 +411,7 @@ export class ImageLoader {
    * @param {FileEntry} file File to index
    * @returns {Promise<any>}
    */
-  private addFileToIndex(file: FileEntry): Promise<any> {
+  protected addFileToIndex(file: FileEntry): Promise<any> {
     return new Promise<any>((resolve, reject) =>
       file.getMetadata(resolve, reject),
     ).then(metadata => {
@@ -438,7 +442,7 @@ export class ImageLoader {
    * Indexes the cache if necessary
    * @returns {Promise<void>}
    */
-  private indexCache(): Promise<void> {
+  protected indexCache(): Promise<void> {
     this.cacheIndex = [];
 
     return this.file.listDir(this.getFileCacheDirectory(), this.config.cacheDirectoryName)
@@ -462,7 +466,7 @@ export class ImageLoader {
    * It checks the cache size and ensures that it doesn't exceed the maximum cache size set in the config.
    * If the limit is reached, it will delete old images to create free space.
    */
-  private maintainCacheSize(): void {
+  protected maintainCacheSize(): void {
     if (this.config.maxCacheSize > -1 && this.indexed) {
       const maintain = () => {
         if (this.currentCacheSize > this.config.maxCacheSize) {
@@ -495,7 +499,7 @@ export class ImageLoader {
    * @param {string} file The name of the file to remove
    * @returns {Promise<any>}
    */
-  private removeFile(file: string): Promise<any> {
+  protected removeFile(file: string): Promise<any> {
     return this.file
       .removeFile(this.getFileCacheDirectory() + this.config.cacheDirectoryName, file)
       .then(() => {
@@ -517,7 +521,7 @@ export class ImageLoader {
    * @param {string} url The remote URL of the image
    * @returns {Promise<string>} Returns a promise that resolves with the local path if exists, or rejects if doesn't exist
    */
-  private getCachedImagePath(url: string): Promise<string> {
+  protected getCachedImagePath(url: string): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       // make sure cache is ready
       if (!this.isCacheReady) {
@@ -601,7 +605,7 @@ export class ImageLoader {
    * Throws a console error if debug mode is enabled
    * @param {any[]} args Error message
    */
-  private throwError(...args: any[]): void {
+  protected throwError(...args: any[]): void {
     if (this.config.debugMode) {
       args.unshift('ImageLoader Error: ');
       console.error.apply(console, args);
@@ -612,7 +616,7 @@ export class ImageLoader {
    * Throws a console warning if debug mode is enabled
    * @param {any[]} args Error message
    */
-  private throwWarning(...args: any[]): void {
+  protected throwWarning(...args: any[]): void {
     if (this.config.debugMode) {
       args.unshift('ImageLoader Warning: ');
       console.warn.apply(console, args);
@@ -624,7 +628,7 @@ export class ImageLoader {
    * @param directory {string} The directory to check. Either this.file.tempDirectory or this.getFileCacheDirectory()
    * @returns {Promise<boolean|FileError>} Returns a promise that resolves if exists, and rejects if it doesn't
    */
-  private cacheDirectoryExists(directory: string): Promise<boolean> {
+  protected cacheDirectoryExists(directory: string): Promise<boolean> {
     return this.file.checkDir(directory, this.config.cacheDirectoryName);
   }
 
@@ -633,7 +637,7 @@ export class ImageLoader {
    * @param replace {boolean} override directory if exists
    * @returns {Promise<DirectoryEntry|FileError>} Returns a promise that resolves if the directories were created, and rejects on error
    */
-  private createCacheDirectory(replace: boolean = false): Promise<any> {
+  protected createCacheDirectory(replace: boolean = false): Promise<any> {
     let cacheDirectoryPromise: Promise<any>, tempDirectoryPromise: Promise<any>;
 
     if (replace) {
@@ -679,7 +683,7 @@ export class ImageLoader {
    * @param {string} url URL of the file
    * @returns {string} Unique file name
    */
-  private createFileName(url: string): string {
+  protected createFileName(url: string): string {
     // hash the url to get a unique file name
     return (
       this.hashString(url).toString() +
@@ -694,7 +698,7 @@ export class ImageLoader {
    * @param {string} string string to hash
    * @returns {number} 32-bit int
    */
-  private hashString(string: string): number {
+  protected hashString(string: string): number {
     let hash = 0,
       char;
     if (string.length === 0) {
@@ -716,7 +720,7 @@ export class ImageLoader {
    * @param {string} url
    * @returns {string}
    */
-  private getExtensionFromUrl(url: string): string {
+  protected getExtensionFromUrl(url: string): string {
     const urlWitoutParams = url.split(/\#|\?/)[0];
     return (
       urlWitoutParams.substr((~-urlWitoutParams.lastIndexOf('.') >>> 0) + 1) ||
